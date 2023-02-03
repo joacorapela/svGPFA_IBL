@@ -1,7 +1,9 @@
 
 import sys
 import argparse
+import configparser
 import numpy as np
+import pickle
 
 from one.api import ONE
 import brainbox.io.one
@@ -14,59 +16,43 @@ def main(argv):
                         default="ebe2efe3-e8a1-451a-8947-76ef42427cc9") # NEURO019
     parser.add_argument("--probe_id", type=str, help="id of the probe to analyze",
                        default="probe00")
-    parser.add_argument("--clusters_ids", type=str, help="cluster IDs to epoch",
-                        default="[40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64]")
     parser.add_argument("--epoch_event_name", help="epoch event name",
                         type=str, default="response_times")
-    parser.add_argument("--epoch_start_event_name", type=str,
-                        help="behavioral event name to use to start epochs",
-                        default="stimOn_times")
-    parser.add_argument("--epoch_end_event_name", type=str,
-                        help="behavioral event name to use to end epochs",
-                        default="stimOff_times")
-    parser.add_argument("--elapsed_start", type=float,
-                       help="elapsed time (in secs) between trials start times and the epoch start event",
-                       default=2.0)
-    parser.add_argument("--elapsed_end", type=float,
-                       help="elapsed time (in secs) between the stimulus offset time and the epoch end event",
-                       default=2.0)
+    parser.add_argument("--results_filename_pattern",
+                        help="results filename pattern",
+                        type=str,
+                        default="../../results/epochedSpikes_eID_{:s}_probeID_{:s}_epochedBy_{:s}.{:s}")
     args = parser.parse_args()
 
     eID = args.eID
     probe_id = args.probe_id
-    clusters_ids = args.clusters_ids[1:-1].split(",")
     epoch_event_name = args.epoch_event_name
-    epoch_start_event_name = args.epoch_start_event_name
-    epoch_end_event_name = args.epoch_end_event_name
-    elapsed_start = args.elapsed_start
-    elapsed_end = args.elapsed_end
+    results_filename_pattern = args.results_filename_pattern
 
-    clusters_ids = [int(cluster_id) for cluster_id in clusters_ids]
 
     one = ONE(base_url='https://openalyx.internationalbrainlab.org',
               password='international', silent=True)
-    spikes = one.load_object(eID, 'spikes', 'alf/probe00/pykilosort')
     trials = one.load_object(eID, 'trials')
+    spikes = one.load_object(eID, 'spikes', 'alf/probe00/pykilosort')
+    clusters = one.load_object(eID, "clusters", f"alf/{probe_id}/pykilosort")
+
+    clusters_ids = np.unique(spikes.clusters)
+    n_clusters = len(clusters_ids)
+    channels_for_clusters_ids = clusters.channels
+    els = brainbox.io.one.load_channel_locations(eID, one=one)
+    locs_for_clusters_ids = els[probe_id]["acronym"][channels_for_clusters_ids].tolist()
 
     epoch_times = trials[epoch_event_name]
     n_trials = len(epoch_times)
     trials_ids = np.arange(n_trials)
 
-    epoch_start_times = trials[epoch_start_event_name]
-    epoch_end_times = trials[epoch_end_event_name]
-    remove_trial = np.logical_or(np.isnan(epoch_times),
-                                 np.logical_or(np.isnan(epoch_start_times),
-                                               np.isnan(epoch_end_times)))
-    keep_trial = np.logical_not(remove_trial)
-    epoch_times = epoch_times[keep_trial]
-    epoch_start_times = epoch_start_times[keep_trial]
-    epoch_end_times = epoch_end_times[keep_trial]
-    trials_ids = trials_ids[keep_trial]
+    epoch_start_times = [trials["intervals"][r][0] for r in range(n_trials)]
+    epoch_end_times = [trials["intervals"][r][1] for r in range(n_trials)]
 
     spikes_times_by_neuron = []
     selected_clusters_ids = []
-    for n in range(len(clusters_ids)):
-        cluster_id = clusters_ids[n]
+    for cluster_id in clusters_ids:
+        print(f"Processing cluster {cluster_id}")
         neuron_spikes_times = spikes.times[spikes.clusters==cluster_id]
         if len(neuron_spikes_times) > 0:
             selected_clusters_ids.append(cluster_id)
@@ -74,35 +60,47 @@ def main(argv):
                 neuron_spikes_times=neuron_spikes_times,
                 epoch_times = epoch_times,
                 epoch_start_times=epoch_start_times,
-                epoch_end_times=epoch_end_times,
-                elapsed_start=elapsed_start,
-                elapsed_end=elapsed_end)
+                epoch_end_times=epoch_end_times)
             spikes_times_by_neuron.append(n_epoched_spikes_times)
     n_neurons = len(selected_clusters_ids)
     n_trials = len(spikes_times_by_neuron[0])
     spikes_times = [[spikes_times_by_neuron[n][r] for n in range(n_neurons)]
                     for r in range(n_trials)]
+    selected_clusters = [[clusters[clusters_key][cluster_id]
+                          if clusters[clusters_key].ndim==1
+                          else clusters[clusters_key]
+                          for cluster_id in selected_clusters_ids]
+                         for clusters_key in clusters.keys()]
+    selected_locs_for_clusters_ids = [locs_for_clusters_ids[cluster_id]
+                                      for cluster_id in selected_clusters_ids]
+    epoch_config = configparser.ConfigParser()
+    epoch_config["params"] = {
+        "eID": eID,
+        "probe_id": probe_id,
+        "clusters_ids": selected_clusters_ids,
+        "epoch_event_name": epoch_event_name,
+    }
+    metadata_filename = results_filename_pattern.format(eID, probe_id,
+                                                        epoch_event_name,
+                                                        "metadata")
+    with open(metadata_filename, "w") as f:
+        epoch_config.write(f)
+    print(f"Saved {metadata_filename}")
+
+    results = {"spikes_times": spikes_times,
+               "clusters_ids": selected_clusters_ids,
+               "trials_info": trials,
+               "clusters_info": selected_clusters,
+               "locs_for_clusters_ids": selected_locs_for_clusters_ids,
+              }
+    results_filename = results_filename_pattern.format(eID, probe_id,
+                                                       epoch_event_name,
+                                                       "pickle")
+    with open(results_filename, "wb") as f:
+        pickle.dump(results, f)
+
     breakpoint()
 
-    els = load_channel_locations(eID, one=one )
-
-    selected_trials_indices = np.nonzero(
-        np.logical_not(np.isnan(trials["epoch_event_name"])))
-    clusters = np.unique(spikes["clusters"])
-    n_neurons = len(clusters)
-
-    trials_start_times = trials[trial_start_event_name][selected_trials_indices]
-    trials_end_times = trials[trial_end_event_name][selected_trials_indices]
-    epoch_times = trials[epoch_event_name][selected_trials_indices]
-    n_trials = len(epoch_times)
-
-    spikes_times = [[None for n in range(n_neurons)] for r in range(n_trials)]
-    for r in range(n_trials):
-        for n in range(n_neurons):
-            # trial_start_time = trials.
-            # spikes_times[r][n] = spikes.times[
-            pass
-    breakpoint()
 
 if __name__ == "__main__":
     main(sys.argv)
